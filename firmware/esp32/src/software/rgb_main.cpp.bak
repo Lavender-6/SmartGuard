@@ -1,0 +1,291 @@
+#include <Arduino.h>
+#include <cstring>
+#include <cstdarg>
+#include "onboard_rgb.h"
+#include "esp32_wifi.h"
+#include "oled_display.h"
+#include "thermistor.h"
+#include "servo_lock.h"
+#include "wifi_config.h"
+
+// ============================================================
+//  FreeRTOS 多任务架构（自检固件）
+//    taskSensors  100ms  热敏电阻采集 → 共享状态（互斥锁保护）
+//    taskDisplay  200ms  OLED 刷新（内容变化才刷，省 I2C 带宽）+ RGB 状态色决策
+//    taskRgb       20ms  板载 RGB 状态灯（绿=正常 / 红=超温，节奏 800ms）
+//    taskNetwork  500ms  WiFi 保活 + 每 10s 向看板上报温度
+//    taskBootKey   20ms  BOOT 键（GPIO0）→ 舵机 0°↔90° toggle
+//    taskMonitor    5s  系统管理：堆内存/传感器健康巡检
+//  核分工：采集/显示/RGB/按键 → core1；网络/监控 → core0（WiFi 协议栈在 core0）
+//  状态灯语义：绿灯闪=环境正常；红灯闪=超温(≥45℃)；黄灯=门开（完整版有门磁）
+// ============================================================
+
+// ---- 共享状态（跨任务访问必须持锁）----
+struct SharedState {
+    float tempC;
+    bool wifiOnline;
+    char ip[16];
+    uint32_t lastTempOkMs;      // 最近一次有效温度的时间戳
+    int servoDeg;               // 舵机当前角度（taskBootKey 写，taskDisplay 读）
+};
+static SharedState g_state = {NAN, false, {0}, 0, SERVO_LOCK_ANGLE};  // 初始 90° = 关门（与 servo.begin 的 lock() 一致）
+static SemaphoreHandle_t g_stateMutex = nullptr;
+static SemaphoreHandle_t g_logMutex = nullptr;
+
+// ---- 外设 ----
+OnboardRgb rgb;
+Esp32Wifi wifi;
+OledDisplay oled;
+Thermistor therm;
+ServoLock servo;   // 舵机测试：GPIO15 / LEDC ch0 / 50Hz
+
+// ---- 任务周期（ms）----
+#define SENSORS_PERIOD_MS  100
+#define DISPLAY_PERIOD_MS  200
+#define RGB_PERIOD_MS       20
+#define NETWORK_PERIOD_MS  500
+#define BOOTKEY_PERIOD_MS   20   // BOOT 键轮询周期
+#define MONITOR_PERIOD_MS 5000
+#define TEMP_POST_INTERVAL_MS 10000
+
+// ---- 带锁的日志（避免多任务串口输出交错）----
+// 注意：部分 arduino-esp32 版本的 HardwareSerial 没有 vprintf 成员，
+// 这里用 vsnprintf 格式化到缓冲区再整体输出，兼容性最好。
+static void logf(const char *fmt, ...) {
+    if (xSemaphoreTake(g_logMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        char buf[160];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        Serial.print(buf);
+        xSemaphoreGive(g_logMutex);
+    }
+}
+
+// ---- 任务：传感器采集 ----
+void taskSensors(void *pv) {
+    (void)pv;
+    TickType_t lastWake = xTaskGetTickCount();
+    for (;;) {
+        float t = therm.readFilteredC();
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            g_state.tempC = t;
+            if (!isnan(t)) g_state.lastTempOkMs = millis();
+            xSemaphoreGive(g_stateMutex);
+        }
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(SENSORS_PERIOD_MS));
+    }
+}
+
+// ---- 任务：OLED 显示 ----
+static char s_oledL1[24] = {0};
+static char s_oledL2[24] = {0};
+static char s_oledL3[24] = {0};
+void taskDisplay(void *pv) {
+    (void)pv;
+    TickType_t lastWake = xTaskGetTickCount();
+    for (;;) {
+        float t = NAN;
+        bool online = false;
+        char ip[16] = {0};
+        int servoDeg = 0;
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            t = g_state.tempC;
+            online = g_state.wifiOnline;
+            servoDeg = g_state.servoDeg;
+            strncpy(ip, g_state.ip, sizeof(ip) - 1);
+            xSemaphoreGive(g_stateMutex);
+        }
+
+        char l1[24], l2[24], l3[24];
+        if (online) snprintf(l1, sizeof(l1), "WiFi OK %s", ip);
+        else snprintf(l1, sizeof(l1), "WiFi .. connecting...");
+        if (isnan(t)) snprintf(l2, sizeof(l2), "T:--.-C (check AO)");
+        else snprintf(l2, sizeof(l2), "T:%.1fC", t);
+
+        // 状态灯决策（优先级从高到低）：
+        //   ① 紧急（超温≥45℃）→ 强制开门 + 红灯
+        //   ② 正常 + 舵机开门(90°) → 黄灯
+        //   ③ 正常 + 舵机关门(0°)  → 绿灯
+        if (!isnan(t) && t >= TEMP_ALARM_THRESHOLD) {
+            rgb.setStatusColor(255, 0, 0);
+            if (servoDeg != SERVO_UNLOCK_ANGLE) {
+                servo.unlock();                       // 紧急强制开门（逃生）
+                servoDeg = SERVO_UNLOCK_ANGLE;
+                if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    g_state.servoDeg = servoDeg;
+                    xSemaphoreGive(g_stateMutex);
+                }
+                logf("[alarm] temp %.1f >= %.1f, FORCE DOOR OPEN\n",
+                     t, TEMP_ALARM_THRESHOLD);
+            }
+        } else if (servoDeg == SERVO_UNLOCK_ANGLE) {
+            rgb.setStatusColor(255, 255, 0);
+        } else {
+            rgb.setStatusColor(0, 255, 0);
+        }
+
+        snprintf(l3, sizeof(l3), "Servo: %d deg", servoDeg);
+
+        if (strcmp(l1, s_oledL1) != 0 || strcmp(l2, s_oledL2) != 0 ||
+            strcmp(l3, s_oledL3) != 0) {
+            strncpy(s_oledL1, l1, sizeof(s_oledL1) - 1);
+            strncpy(s_oledL2, l2, sizeof(s_oledL2) - 1);
+            strncpy(s_oledL3, l3, sizeof(s_oledL3) - 1);
+            oled.showThreeLinesSmall(l1, l2, l3);
+        }
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+    }
+}
+
+// ---- 任务：板载 RGB ----
+void taskRgb(void *pv) {
+    (void)pv;
+    TickType_t lastWake = xTaskGetTickCount();
+    for (;;) {
+        rgb.cycleUpdate(millis());
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(RGB_PERIOD_MS));
+    }
+}
+
+// ---- 任务：BOOT 按键（GPIO0，按下低电平）→ 舵机 0°↔90° toggle ----
+// 按一下开门(90°)，再按一下关门(0°)
+void taskBootKey(void *pv) {
+    (void)pv;
+    logf("[boot] key task ready on GPIO%d, press to toggle servo\n", PIN_BOOT_KEY);
+    TickType_t lastWake = xTaskGetTickCount();
+    bool lastLevel = HIGH;
+    uint32_t lastPressMs = 0;
+    bool opened = false;   // false = 当前关门(0°)，true = 开门(90°)
+    for (;;) {
+        bool level = digitalRead(PIN_BOOT_KEY);
+        uint32_t now = millis();
+        // 下降沿 + 50ms 时间窗去抖（20ms 轮询本身也是消抖）
+        if (level == LOW && lastLevel == HIGH && now - lastPressMs > 50) {
+            lastPressMs = now;
+            int deg = SERVO_LOCK_ANGLE;
+            if (opened) {
+                servo.lock();      // → 0° 关门
+                logf("[boot] servo -> %d deg (door closed)\n", SERVO_LOCK_ANGLE);
+            } else {
+                servo.unlock();    // → 90° 开门
+                deg = SERVO_UNLOCK_ANGLE;
+                logf("[boot] servo -> %d deg (door opened)\n", SERVO_UNLOCK_ANGLE);
+            }
+            opened = !opened;
+            // 角度写入共享状态（OLED 第三行 + 状态灯要用，持锁）
+            if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                g_state.servoDeg = deg;
+                xSemaphoreGive(g_stateMutex);
+            }
+        }
+        lastLevel = level;
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(BOOTKEY_PERIOD_MS));
+    }
+}
+
+// ---- 任务：网络（首次进入时初始化 WiFi，阻塞最多 15s 只影响本任务）----
+void taskNetwork(void *pv) {
+    (void)pv;
+    TickType_t lastWake = xTaskGetTickCount();
+    uint32_t lastPost = 0;
+    static bool started = false;
+
+    if (!started) {
+        started = true;
+        wifi.begin(WIFI_SSID, WIFI_PASS);
+    }
+
+    for (;;) {
+        wifi.loop();
+
+        bool online = wifi.isConnected();
+        char ip[16] = {0};
+        if (online) strncpy(ip, wifi.ip().c_str(), sizeof(ip) - 1);
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            g_state.wifiOnline = online;
+            if (online) strncpy(g_state.ip, ip, sizeof(g_state.ip) - 1);
+            xSemaphoreGive(g_stateMutex);
+        }
+
+        // 定时上报温度到 Web 看板
+        float t = NAN;
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            t = g_state.tempC;
+            xSemaphoreGive(g_stateMutex);
+        }
+        if (online && !isnan(t) && millis() - lastPost > TEMP_POST_INTERVAL_MS) {
+            lastPost = millis();
+            wifi.postEvent("temp", t);
+        }
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(NETWORK_PERIOD_MS));
+    }
+}
+
+// ---- 任务：系统管理 ----
+void taskMonitor(void *pv) {
+    (void)pv;
+    TickType_t lastWake = xTaskGetTickCount();
+    for (;;) {
+        float t = NAN;
+        uint32_t lastOk = 0;
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            t = g_state.tempC;
+            lastOk = g_state.lastTempOkMs;
+            xSemaphoreGive(g_stateMutex);
+        }
+
+        char tempBuf[12];
+        if (isnan(t)) snprintf(tempBuf, sizeof(tempBuf), "NAN");
+        else snprintf(tempBuf, sizeof(tempBuf), "%.1f", t);
+
+        logf("[mon] up=%lus heap=%u min=%u temp=%s rssi=%d\n",
+             (unsigned long)(millis() / 1000),
+             ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+             tempBuf,
+             wifi.isConnected() ? wifi.rssi() : 0);
+
+        // 传感器健康巡检：30s 读不到有效温度 → 提示查线
+        if (millis() - lastOk > 30000) {
+            logf("[mon] WARN: thermistor no valid data for 30s, check AO wiring\n");
+        }
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MONITOR_PERIOD_MS));
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(300);
+    Serial.println("\n[SmartGuard] FreeRTOS self-test");
+
+    g_stateMutex = xSemaphoreCreateMutex();
+    g_logMutex = xSemaphoreCreateMutex();
+
+    rgb.begin(ONBOARD_RGB_PIN);                 // _brightness 默认 128 = 50% 亮度
+    rgb.setStatusColor(0, 255, 0);              // 状态灯：绿灯 = 环境正常
+    pinMode(PIN_BOOT_KEY, INPUT_PULLUP);        // BOOT 键 = GPIO0，按下低电平
+    servo.begin(PIN_SERVO, SERVO_CH);           // 舵机：GPIO15 / LEDC ch0，begin 内置先回 0°
+    if (!oled.begin(OLED_I2C_ADDR, PIN_I2C_SDA, PIN_I2C_SCL)) {
+        Serial.println("[oled] not found! check 0x3C/0x3D and wiring");
+    }
+    therm.begin(PIN_THERMISTOR);                // 热敏模块 AO → GPIO2（ADC1_CH1）
+    char bootLine[24];
+    snprintf(bootLine, sizeof(bootLine), "Servo: %d deg", SERVO_LOCK_ANGLE);
+    oled.showThreeLinesSmall("SmartGuard v1.0", "BOOT key -> servo", bootLine);
+
+    // 创建任务（优先级：采集 3 > 网络/显示 2 > 监控/RGB/按键 1）
+    xTaskCreatePinnedToCore(taskSensors, "sensors", 4096, nullptr, 3, nullptr, 1);
+    xTaskCreatePinnedToCore(taskDisplay, "display", 4096, nullptr, 2, nullptr, 1);
+    xTaskCreatePinnedToCore(taskNetwork, "network", 8192, nullptr, 2, nullptr, 0);
+    xTaskCreatePinnedToCore(taskMonitor, "monitor", 4096, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(taskRgb,     "rgb",     2048, nullptr, 1, nullptr, 1);
+    xTaskCreatePinnedToCore(taskBootKey, "bootkey", 2048, nullptr, 1, nullptr, 1);
+
+    Serial.printf("[SmartGuard] 6 tasks started, heap=%u\n", ESP.getFreeHeap());
+}
+
+void loop() {
+    // 主循环退位为心跳，全部工作由 FreeRTOS 任务承担
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}

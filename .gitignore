@@ -1,0 +1,25 @@
+# ---- 构建产物 ----
+.pio/
+.vscode/
+cmake-build-*/
+build/
+*.map
+*.elf
+*.bin
+*.hex
+*.o
+*.d
+
+# ---- IDE ----
+.idea/
+*.iml
+*.code-workspace
+
+# ---- 运行时数据 ----
+dashboard/events.jsonl
+*.log
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini
+.DS_Store
